@@ -14,7 +14,8 @@
 
 
 from __future__ import print_function, absolute_import
-from .param import Parameterized, AutoFlow, DataHolder
+from .param import Parameterized, AutoFlow, DataHolder, Param
+from .transforms import Logistic
 from scipy.optimize import minimize, OptimizeResult
 import numpy as np
 import tensorflow as tf
@@ -356,6 +357,24 @@ class GPModel(Model):
 
     def build_predict(self):
         raise NotImplementedError
+    
+    @property
+    def X(self):
+        if not self._tf_mode:
+            return self.X_train
+        
+        try:
+            return tf.concat(0, [self.X_train, self.X_new])
+        except:
+            return self.X_train
+        
+    @X.setter
+    def X(self, value):
+        self.X_train = value
+        
+    @x.deleter
+    def X(self):
+        del self.X_train
 
     @AutoFlow((float_type, [None, None]))
     def predict_f(self, Xnew):
@@ -408,3 +427,21 @@ class GPModel(Model):
         """
         pred_f_mean, pred_f_var = self.build_predict(Xnew)
         return self.likelihood.predict_density(pred_f_mean, pred_f_var, Ynew)
+    
+    def inverse_predict_x(self, Ynew):
+        self.fixed = True
+        self.X_new = Param(np.tile(np.mean(self.X.value, axis=0), (Ynew.shape[0],1)))
+        self.X_new.transform = Logistic(np.min(self.X.value), np.max(self.X.value))
+        Yold = self.Y
+        self.Y = DataHolder(np.vstack((self.Y.value, Ynew)))
+        
+        # Optimizing X's
+        self.optimize()
+        X_new = self.X_new.value
+        
+        # cleanup
+        self.Y = Yold
+        del self.X_new
+        return X_new
+        
+        
