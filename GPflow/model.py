@@ -372,7 +372,7 @@ class GPModel(Model):
     def X(self, value):
         self.X_train = value
         
-    @x.deleter
+    @X.deleter
     def X(self):
         del self.X_train
 
