@@ -14,6 +14,7 @@
 
 
 from __future__ import print_function, absolute_import
+from uuid import uuid4
 from .param import Parameterized, AutoFlow, DataHolder
 from scipy.optimize import minimize, OptimizeResult
 import numpy as np
@@ -116,35 +117,20 @@ class Model(Parameterized):
         Parameterized.__setstate__(self, d)
         self._needs_recompile = True
 
-    def _compile(self, optimizer=None):
+    def _create_likelihood_graph(self):
+        self._free_vars = tf.Variable(self.get_free_state())
+        self.make_tf_array(self._free_vars)
+        with self.tf_mode():
+            f = self.build_likelihood() + self.build_prior()
+            g, = tf.gradients(f, self._free_vars)
+
+        self._minusF = tf.negative(f, name='objective')
+        self._minusG = tf.negative(g, name='grad_objective')
+
+    def _compile(self):
         """
         compile the tensorflow function "self._objective"
         """
-        self._graph = tf.Graph()
-        self._session = session.get_session(graph=self._graph,
-                                            output_file_name=settings.profiling.output_file_name + "_objective",
-                                            output_directory=settings.profiling.output_directory,
-                                            each_time=settings.profiling.each_time)
-        with self._graph.as_default():
-            self._free_vars = tf.Variable(self.get_free_state())
-
-            self.make_tf_array(self._free_vars)
-            with self.tf_mode():
-                f = self.build_likelihood() + self.build_prior()
-                g, = tf.gradients(f, self._free_vars)
-
-            self._minusF = tf.negative(f, name='objective')
-            self._minusG = tf.negative(g, name='grad_objective')
-
-            # The optimiser needs to be part of the computational graph, and needs
-            # to be initialised before tf.initialise_all_variables() is called.
-            if optimizer is None:
-                opt_step = None
-            else:
-                opt_step = optimizer.minimize(self._minusF,
-                                              var_list=[self._free_vars])
-            init = tf.global_variables_initializer()
-        self._session.run(init)
 
         # build tensorflow functions for computing the likelihood
         if settings.verbosity.tf_compile_verb:
@@ -165,8 +151,6 @@ class Model(Parameterized):
             print("done")
         sys.stdout.flush()
         self._needs_recompile = False
-
-        return opt_step
 
     @AutoFlow()
     def compute_log_prior(self):
@@ -221,15 +205,80 @@ class Model(Parameterized):
         if type(method) is str:
             return self._optimize_np(method, tol, callback, maxiter, **kw)
         else:
+            self._graph = tf.Graph()
             return self._optimize_tf(method, callback, maxiter, **kw)
 
     def _optimize_tf(self, method, callback, maxiter):
+        if settings.distributed.distribute:
+            result = self._optimize_tf_distributed(method, maxiter)
+        else:
+            result = self._optimize_tf_local(method, callback, maxiter)
+        self.set_state(result['x'])
+        fun, jac = self._objective(result['x'])
+        msg = "Finished iterations." if result['success'] else "Optimization interrupted."
+        r = OptimizeResult(message=msg,
+                           fun=fun,
+                           jac=jac,
+                           status=msg,
+                           **result)
+        return r
+
+    def _optimize_tf_distributed(self, method, maxiter):
+        cluster = tf.train.ClusterSpec({"ps": settings.distributed.ps_hosts.split(","),
+                                        "worker": settings.distributed.worker_hosts.split(",")})
+        server = tf.train.Server(cluster, job_name='worker', task_index=tf.app.flags.task_index)
+        feed_dict = {}
+
+        with self._graph.as_default():
+            with tf.device(tf.train.replica_device_setter(
+                    worker_device="/job:worker/task:{0}".format(tf.app.flags.task_index),
+                    cluster=cluster)):
+                self._create_likelihood_graph()
+                global_step = tf.Variable(0, name="global_step")
+                saver = tf.train.Saver()
+                summary = tf.summary.merge_all()
+                opt_step = method.minimize(self._minusF, var_list=[self._free_vars], global_step=global_step)
+                init = tf.global_variables_initializer()
+
+                # Create supervisor
+        sv = tf.train.Supervisor(graph=self._graph, is_chief=(tf.app.flags.task_index == 0),
+                                 logdir="{0}-{1}".format(settings.distributed.log_directory,str(uuid4())),
+                                 init_op=init,
+                                 summary_op=summary,
+                                 saver=saver,
+                                 global_step=global_step,
+                                 save_model_secs=600)
+
+        self._session = sv.PrepareSession(server.target)
+        self._compile()
+
+        # Supervisor initializes, checkpointing, closing and dealing with errors.
+        step = 0
+        while not sv.should_stop() and step < maxiter:
+            feed_dict_keys = self.get_feed_dict_keys()
+            self.update_feed_dict(feed_dict_keys, feed_dict)
+            _, step = self._session.run([opt_step, global_step], feed_dict=feed_dict)
+            print(step)
+        final_x = self._session.run(self._free_vars)
+        sv.stop()
+        return {'x': final_x, 'success': True}
+
+    def _optimize_tf_local(self, method, callback, maxiter):
         """
         Optimize the model using a tensorflow optimizer. See self.optimize()
         """
-        opt_step = self._compile(optimizer=method)
-        feed_dict = {}
+        with self._graph.as_default():
+            self._create_likelihood_graph()
+            opt_step = method.minimize(self._minusF, var_list=[self._free_vars])
+            init = tf.global_variables_initializer()
+        self._session = session.get_session(graph=self._graph,
+                                            output_file_name=settings.profiling.output_file_name + "_objective",
+                                            output_directory=settings.profiling.output_directory,
+                                            each_time=settings.profiling.each_time)
+        self._session.run(init)
+        self._compile()
 
+        feed_dict = {}
         try:
             iteration = 0
             while iteration < maxiter:
@@ -238,22 +287,13 @@ class Model(Parameterized):
                 if callback is not None:
                     callback(self._session.run(self._free_vars))
                 iteration += 1
+            status = True
         except KeyboardInterrupt:
             print("Caught KeyboardInterrupt, setting model\
                   with most recent state.")
-            self.set_state(self._session.run(self._free_vars))
-            return None
-
+            status = False
         final_x = self._session.run(self._free_vars)
-        self.set_state(final_x)
-        fun, jac = self._objective(final_x)
-        r = OptimizeResult(x=final_x,
-                           success=True,
-                           message="Finished iterations.",
-                           fun=fun,
-                           jac=jac,
-                           status="Finished iterations.")
-        return r
+        return {'x': final_x, 'success': status}
 
     def _optimize_np(self, method='L-BFGS-B', tol=None, callback=None,
                      maxiter=1000, **kw):
@@ -278,7 +318,20 @@ class Model(Parameterized):
         max_iters is the maximum number of iterations (used in the options dict
             for the optimization routine)
         """
+        if settings.distributed.distribute:
+            import warnings
+            warnings.warn("Distributed support only available with tf optimizers, disabling.", RuntimeWarning)
+
         if self._needs_recompile:
+            self._graph = tf.Graph()
+            with self._graph.as_default():
+                self._create_likelihood_graph()
+                init = tf.global_variables_initializer()
+            self._session = session.get_session(graph=self._graph,
+                                                output_file_name=settings.profiling.output_file_name + "_objective",
+                                                output_directory=settings.profiling.output_directory,
+                                                each_time=settings.profiling.each_time)
+            self._session.run(init)
             self._compile()
 
         options = dict(disp=settings.verbosity.optimisation_verb, maxiter=maxiter)

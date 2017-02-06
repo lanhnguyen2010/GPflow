@@ -18,3 +18,9 @@ dump_tensorboard = False
 output_file_name = timeline
 output_directory = ./
 each_time = False
+
+[distributed]
+distribute = True
+log_directory = /tmp/train_log
+worker_hosts = 127.0.0.1:2222,127.0.0.1:2223
+ps_hosts = 127.0.0.1:2224
