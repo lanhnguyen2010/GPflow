@@ -110,10 +110,44 @@ class RBF(kernels.RBF):
                      tf.reshape(tf.transpose(Z), [1, D, M, 1])) - tf.reshape(Xmu, [N, D, 1, 1])  # NxDxMxM
         svec = tf.reshape(vec, (N, D, M * M))
         ssmI_z = tf.matrix_triangular_solve(cm, svec)  # NxDx(M*M)
-        smI_z = tf.reshape(ssmI_z, (N, D, M, M)) # NxDxMxM
-        fs = tf.reduce_sum(tf.square(smI_z), [1]) # NxMxM
+        smI_z = tf.reshape(ssmI_z, (N, D, M, M))  # NxDxMxM
+        fs = tf.reduce_sum(tf.square(smI_z), [1])  # NxMxM
 
         return self.variance ** 2.0 * tf.expand_dims(Kmms, 0) * tf.exp(-0.5 * fs) * tf.reshape(det ** -0.5, [N, 1, 1])
+
+    @AutoFlow((float_type, [None, None]), (float_type, [None, None]), (float_type,))
+    def compute_eKzxKzxKzx(self, Z, Xmu, Xcov):
+        return self.eKzxKzxKzx(Z, Xmu, Xcov)
+
+    def eKzxKzxKzx(self, Z, Xmu, Xcov):
+        Xcov = self._slice_cov(Xcov)
+        Z, Xmu = self._slice(Z, Xmu)
+        M = tf.shape(Z)[0]
+        N = tf.shape(Xmu)[0]
+        D = tf.shape(Xmu)[1]
+        lengthscales = self.lengthscales if self.ARD else tf.zeros((D,), dtype=float_type) + self.lengthscales
+
+        scalemat = tf.expand_dims(eye(D), 0) + 3 * Xcov * tf.reshape(lengthscales ** -2.0, [1, 1, -1])
+        det = tf.matrix_determinant(scalemat)
+
+        mat = Xcov + 1.0 / 3.0 * tf.expand_dims(tf.diag(lengthscales ** 2.0), 0)  # NxDxD
+        cm = tf.cholesky(mat)
+        vec = 1.0 / 3.0 * (tf.reshape(tf.transpose(Z), [1, D, 1, 1, M]) +
+                           tf.reshape(tf.transpose(Z), [1, D, 1, M, 1]) +
+                           tf.reshape(tf.transpose(Z), [1, D, M, 1, 1])) - tf.reshape(Xmu,
+                                                                                      [N, D, 1, 1,
+                                                                                       1])  # N x D x M x M x M
+        svec = tf.reshape(vec, (N, D, M * M * M))  # N x D x N*M*M
+        ssmI_z = tf.matrix_triangular_solve(cm, svec)  # N x D x N*M*M
+        smI_z = tf.reshape(ssmI_z, (N, D, M, M, M))  # N x D x M x M x M
+        fs = tf.reduce_sum(tf.square(smI_z), [1])  # N x M x M x M
+
+        Z1 = tf.reduce_sum(tf.square(Z / lengthscales), axis=1)  # M
+        Z2 = tf.einsum('ij,kj->ik', Z / lengthscales, Z / lengthscales)
+        Kmms = tf.exp(-1.0 / 3.0 * (tf.reshape(Z1, [1, M, 1, 1]) + tf.reshape(Z1, [1, 1, M, 1])
+                                    + tf.reshape(Z1, [1, 1, 1, M]) - tf.reshape(Z2, [1, 1, M, M])
+                                    - tf.reshape(Z2, [1, M, 1, M]) - tf.reshape(Z2, [1, M, M, 1])))
+        return self.variance ** 3.0 * Kmms * tf.exp(-0.5 * fs) * tf.reshape(det ** -0.5, [N, 1, 1, 1])
 
 
 class Linear(kernels.Linear):
@@ -245,7 +279,7 @@ class Add(kernels.Add):
                                  tf.matmul(tf.tile(Xcov[:, None, :, :], [1, M, 1, 1]), vecplus)
                                  )[:, :, :, 0] * lengthscales2[None, None, :]  # NxMxD
         a = tf.matmul(tf.tile(Z[None, :, :], [N, 1, 1]),
-                            mean * exp[:, :, None] * det[:, None, None] * const, transpose_b=True)
+                      mean * exp[:, :, None] * det[:, None, None] * const, transpose_b=True)
         return a + tf.transpose(a, [0, 2, 1])
 
     def quad_eKzx1Kxz2(self, Ka, Kb, Z, Xmu, Xcov):
