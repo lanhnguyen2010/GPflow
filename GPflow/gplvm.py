@@ -17,7 +17,6 @@ float_type = settings.dtypes.float_type
 int_type = settings.dtypes.int_type
 
 
-
 def PCA_reduce(X, Q):
     """
     A helpful function for linearly reducing the dimensionality of the data X
@@ -62,7 +61,7 @@ class GPLVM(GPR):
 
 
 class BayesianGPLVM(GPModel):
-    def __init__(self, X_mean, X_var, Y, kern, M, Z=None, X_prior_mean=None, X_prior_var=None):
+    def __init__(self, X_mean, X_var, Y, kern, M, Z=None):
         """
         Initialise Bayesian GPLVM object. This method only works with a Gaussian likelihood.
         :param X_mean: initial latent positions, size N (number of points) x Q (latent dimensions).
@@ -77,12 +76,12 @@ class BayesianGPLVM(GPModel):
         """
         GPModel.__init__(self, X_mean, Y, kern, likelihood=likelihoods.Gaussian(), mean_function=Zero())
         del self.X  # in GPLVM this is a Param
-        self.X_mean = Param(X_mean)
+        self.X_mean = DataHolder(X_mean)
         # diag_transform = transforms.DiagMatrix(X_var.shape[1])
         # self.X_var = Param(diag_transform.forward(transforms.positive.backward(X_var)) if X_var.ndim == 2 else X_var,
         #                    diag_transform)
         assert X_var.ndim == 2
-        self.X_var = Param(X_var, transforms.positive)
+        self.X_var = DataHolder(X_var)
         self.num_data = X_mean.shape[0]
         self.output_dim = Y.shape[1]
 
@@ -100,19 +99,6 @@ class BayesianGPLVM(GPModel):
         self.num_latent = Z.shape[1]
         assert X_mean.shape[1] == self.num_latent
 
-        # deal with parameters for the prior mean variance of X
-        if X_prior_mean is None:
-            X_prior_mean = np.zeros((self.num_data, self.num_latent))
-        self.X_prior_mean = X_prior_mean
-        if X_prior_var is None:
-            X_prior_var = np.ones((self.num_data, self.num_latent))
-        self.X_prior_var = X_prior_var
-
-        assert X_prior_mean.shape[0] == self.num_data
-        assert X_prior_mean.shape[1] == self.num_latent
-        assert X_prior_var.shape[0] == self.num_data
-        assert X_prior_var.shape[1] == self.num_latent
-
     def build_likelihood(self):
         """
         Construct a tensorflow function to compute the bound on the marginal
@@ -120,7 +106,7 @@ class BayesianGPLVM(GPModel):
         """
 
         # Default: construct likelihood graph using the training data Y and initialized q(X)
-        return self._build_likelihood_graph(self.X_mean, self.X_var, self.Y, self.X_prior_mean, self.X_prior_var)
+        return self._build_likelihood_graph(self.X_mean, self.X_var, self.Y)
 
     def _build_likelihood_graph(self, X_mean, X_var, Y, X_prior_mean=None, X_prior_var=None):
         """
@@ -132,16 +118,11 @@ class BayesianGPLVM(GPModel):
         method for inference of latent points for new data points
         """
 
-        if X_prior_mean is None:
-            X_prior_mean = tf.zeros((tf.shape(Y)[0], self.num_latent), float_type)
-        if X_prior_var is None:
-            X_prior_var = tf.ones((tf.shape(Y)[0], self.num_latent), float_type)
-
         num_inducing = tf.shape(self.Z)[0]
         psi0 = tf.reduce_sum(self.kern.eKdiag(X_mean, X_var), 0)
         psi1 = self.kern.eKxz(self.Z, X_mean, X_var)
         psi2 = tf.reduce_sum(self.kern.eKzxKxz(self.Z, X_mean, X_var), 0)
-        Kuu = self.kern.K(self.Z) + eye(num_inducing) * 1e-6
+        Kuu = self.kern.K(self.Z) + eye(num_inducing) * 5e-6
         L = tf.cholesky(Kuu)
         sigma2 = self.likelihood.variance
         sigma = tf.sqrt(sigma2)
@@ -154,15 +135,7 @@ class BayesianGPLVM(GPModel):
         LB = tf.cholesky(B)
         log_det_B = 2. * tf.reduce_sum(tf.log(tf.diag_part(LB)))
         c = tf.matrix_triangular_solve(LB, tf.matmul(A, Y), lower=True) / sigma
-
-        # KL[q(x) || p(x)]
-        dX_var = X_var if len(X_var.get_shape()) == 2 else tf.matrix_diag_part(X_var)
-        NQ = tf.cast(tf.size(X_mean), float_type)
         D = tf.cast(tf.shape(Y)[1], float_type)
-        KL = -0.5 * tf.reduce_sum(tf.log(dX_var)) \
-             + 0.5 * tf.reduce_sum(tf.log(X_prior_var)) \
-             - 0.5 * NQ \
-             + 0.5 * tf.reduce_sum((tf.square(X_mean - X_prior_mean) + dX_var) / X_prior_var)
 
         # compute log marginal bound
         ND = tf.cast(tf.size(Y), float_type)
@@ -172,7 +145,6 @@ class BayesianGPLVM(GPModel):
         bound += 0.5 * tf.reduce_sum(tf.square(c))
         bound += -0.5 * D * (tf.reduce_sum(psi0) / sigma2 -
                              tf.reduce_sum(tf.diag_part(AAT)))
-        bound -= KL
         return bound
 
     def build_predict(self, Xnew, full_cov=False):
@@ -222,28 +194,30 @@ class BayesianGPLVM(GPModel):
         :param Xstarvar: variance of the points in latent space size: Nnew (number of new points ) x Q (latent dim)
         :return: tensor for computation of the moments of the output distribution.
         """
-        num_inducing = tf.shape(self.Z)[0] # M
-        num_predict = tf.shape(Xstarmu)[0] # N*
-        num_out = self.output_dim     # p
+        num_inducing = tf.shape(self.Z)[0]  # M
+        num_predict = tf.shape(Xstarmu)[0]  # N*
+        num_out = self.output_dim  # p
+        N = self.num_data
+        psi3 = self.kern.eKzxKzxKzx(self.Z, Xstarmu, Xstarvar)
 
         # Kernel expectations, w.r.t q(X) and q(X*)
-        psi1 = self.kern.eKxz(self.Z, self.X_mean, self.X_var) # N x M
-        psi2 = tf.reduce_sum(self.kern.eKzxKxz(self.Z, self.X_mean, self.X_var), 0) # M x M
-        psi0star = self.kern.eKdiag(Xstarmu, Xstarvar) # N*
-        psi1star = self.kern.eKxz(self.Z, Xstarmu, Xstarvar) # N* x M
-        psi2star = self.kern.eKzxKxz(self.Z, Xstarmu, Xstarvar) # N* x M x M
+        psi1 = self.kern.eKxz(self.Z, self.X_mean, self.X_var)  # N x M
+        psi2 = tf.reduce_sum(self.kern.eKzxKxz(self.Z, self.X_mean, self.X_var), 0)  # M x M
+        psi0star = self.kern.eKdiag(Xstarmu, Xstarvar)  # N*
+        psi1star = self.kern.eKxz(self.Z, Xstarmu, Xstarvar)  # N* x M
+        psi2star = self.kern.eKzxKxz(self.Z, Xstarmu, Xstarvar)  # N* x M x M
 
-        Kuu = self.kern.K(self.Z) + eye(num_inducing) * 1e-6 # M x M
+        Kuu = self.kern.K(self.Z) + eye(num_inducing) * 1e-6  # M x M
         sigma2 = self.likelihood.variance
         sigma = tf.sqrt(sigma2)
-        L = tf.cholesky(Kuu) # M x M
+        L = tf.cholesky(Kuu)  # M x M
 
-        A = tf.matrix_triangular_solve(L, tf.transpose(psi1), lower=True) / sigma # M x N
-        tmp = tf.matrix_triangular_solve(L, psi2, lower=True) # M x M
+        A = tf.matrix_triangular_solve(L, tf.transpose(psi1), lower=True) / sigma  # M x N
+        tmp = tf.matrix_triangular_solve(L, psi2, lower=True)  # M x M
         AAT = tf.matrix_triangular_solve(L, tf.transpose(tmp), lower=True) / sigma2
         B = AAT + eye(num_inducing)
-        LB = tf.cholesky(B) # M x M
-        c = tf.matrix_triangular_solve(LB, tf.matmul(A, self.Y), lower=True) / sigma # M x p
+        LB = tf.cholesky(B)  # M x M
+        c = tf.matrix_triangular_solve(LB, tf.matmul(A, self.Y), lower=True) / sigma  # M x p
         tmp1 = tf.matrix_triangular_solve(L, tf.transpose(psi1star), lower=True)
         tmp2 = tf.matrix_triangular_solve(LB, tmp1, lower=True)
         mean = tf.matmul(tf.transpose(tmp2), c)
@@ -258,11 +232,51 @@ class BayesianGPLVM(GPModel):
 
         c3 = tf.tile(tf.expand_dims(c, 0), [num_predict, 1, 1])  # N* x M x p
         TT = tf.trace(tmp5 - tmp6)  # N*
-        diagonals = tf.einsum("ij,k->ijk", eye(num_out), psi0star - TT) # p x p x N*
+        diagonals = tf.einsum("ij,k->ijk", eye(num_out), psi0star - TT)  # p x p x N*
         covar1 = tf.matmul(tf.transpose(c3, perm=[0, 2, 1]), tf.matmul(tmp6 - tmp4, c3))  # N* x p x p
         covar2 = tf.transpose(diagonals, perm=[2, 0, 1])  # N* x p x p
         covar = covar1 + covar2
-        return mean + self.mean_function(Xstarmu), covar
+        covar = tf.matrix_diag_part(covar)
+
+        tmp1 = tf.cholesky_solve(LB, tf.matmul(A, self.Y))
+        V = tf.matrix_triangular_solve(tf.transpose(L), tmp1, lower=False)  # M x D
+        V = V / sigma
+        temp = tf.reshape(
+            tf.transpose(
+                tf.reshape(tf.matmul(tf.reshape(psi3, [num_predict * num_inducing * num_inducing, num_inducing]), V),
+                           [num_predict, num_inducing, num_inducing, num_out]),
+                [0, 1, 3, 2]),
+            [num_predict * num_inducing * num_out, num_inducing])
+        temp2 = tf.reshape(
+            tf.transpose(tf.reshape(tf.matmul(temp, V), [num_predict, num_inducing, num_out, num_out]), [0, 2, 3, 1]),
+            [num_predict * num_out * num_out, num_inducing])
+        temp3 = tf.matrix_diag_part(
+            tf.matrix_diag_part(tf.reshape(tf.matmul(temp2, V), [num_predict, num_out, num_out, num_out])))
+        temp4 = tf.matrix_triangular_solve(L, tf.reshape(tf.transpose(psi3, perm=[1, 2, 3, 0]),
+                                                         [num_inducing, num_inducing * num_inducing * num_predict]))
+        temp4 = tf.matrix_triangular_solve(L, tf.reshape(
+            tf.transpose(tf.reshape(temp4, [num_inducing, num_inducing, num_inducing, num_predict]), [1, 2, 0, 3]),
+            [num_inducing, num_inducing * num_inducing * num_predict]))
+        temp4 = tf.matmul(tf.reshape(
+            tf.transpose(tf.reshape(temp4, [num_inducing, num_inducing, num_inducing, num_predict]), [3, 0, 2, 1]),
+            [num_predict * num_inducing * num_inducing, num_inducing]), V)
+        temp4 = tf.reduce_sum(tf.matrix_diag_part(
+            tf.transpose(tf.reshape(temp4, [num_predict, num_inducing, num_inducing, num_out]), [0, 3, 1, 2])), axis=2)
+
+        L = tf.matmul(L, LB)
+        temp5 = tf.matrix_triangular_solve(L, tf.reshape(tf.transpose(psi3, perm=[1, 2, 3, 0]),
+                                                         [num_inducing, num_inducing * num_inducing * num_predict]))
+        temp5 = tf.matrix_triangular_solve(L, tf.reshape(
+            tf.transpose(tf.reshape(temp5, [num_inducing, num_inducing, num_inducing, num_predict]), [1, 2, 0, 3]),
+            [num_inducing, num_inducing * num_inducing * num_predict]))
+        temp5 = tf.matmul(tf.reshape(
+            tf.transpose(tf.reshape(temp5, [num_inducing, num_inducing, num_inducing, num_predict]), [3, 0, 2, 1]),
+            [num_predict * num_inducing * num_inducing, num_inducing]), V)
+        temp5 = tf.reduce_sum(tf.matrix_diag_part(
+            tf.transpose(tf.reshape(temp5, [num_predict, num_inducing, num_inducing, num_out]), [0, 3, 1, 2])), axis=2)
+
+        fskew = temp3 - mean ** 3.0 + 3.0 * tf.expand_dims(psi0star, 1) * mean - 3.0 * (temp4 - temp5) - 3.0 * mean * covar
+        return mean + self.mean_function(Xstarmu), covar, fskew
 
     @AutoFlow((float_type, [None, None]), (float_type, [None, None]),
               (float_type, [None, None]), (int_type, [None]))
@@ -308,7 +322,7 @@ class BayesianGPLVM(GPModel):
             var_new = x_flat[half_num_param:].reshape((infer_number, self.num_latent))
 
             # Compute likelihood & flatten gradients
-            f,g = self.held_out_data_objective(Ynew, mu_new, var_new, observed)
+            f, g = self.held_out_data_objective(Ynew, mu_new, var_new, observed)
             return f, np.hstack(map(lambda gradient: gradient.flatten(), g))
 
         return fun
@@ -352,7 +366,7 @@ class BayesianGPLVM(GPModel):
                           jac=True,
                           method=method,
                           tol=tol,
-                          bounds = [(None, None)]*int(x_init.size/2) + [(0, None)]*int(x_init.size/2),
+                          bounds=[(None, None)] * int(x_init.size / 2) + [(0, None)] * int(x_init.size / 2),
                           options=kwargs)
         x_hat = result.x
         mu = x_hat[:infer_number * self.num_latent].reshape((infer_number, self.num_latent))
@@ -377,7 +391,7 @@ class BayesianGPLVM(GPModel):
         :rtype mean: np.ndarray, size Nnew (number of new points ) x D
         covar: np.ndarray, size Nnew (number of new points ) x D x D
         """
-        assert(isinstance(self.mean_function, (Zero, Constant)))
+        assert (isinstance(self.mean_function, (Zero, Constant)))
         return self.build_predict_distribution(Xstarmu, Xstarvar)
 
     @AutoFlow((float_type, [None, None]), (float_type, [None, None]))
@@ -388,12 +402,12 @@ class BayesianGPLVM(GPModel):
 
         Note: this method is only available in combination with Constant or Zero mean functions.
         """
-        assert(isinstance(self.mean_function, (Zero, Constant)))
+        assert (isinstance(self.mean_function, (Zero, Constant)))
         mean, covar = self.build_predict_distribution(Xstarmu, Xstarvar)
         num_predict = tf.shape(mean)[0]
         num_out = tf.shape(mean)[1]
         noise = tf.tile(tf.expand_dims(self.likelihood.variance * eye(num_out), 0), [num_predict, 1, 1])
-        return mean, covar+noise
+        return mean, covar + noise
 
     def predict_f_unobserved(self, Ynew, observed):
         """
@@ -412,9 +426,9 @@ class BayesianGPLVM(GPModel):
         covar: np.ndarray, size Nnew (number of new points ) x D-k x D-k
         """
         observed = np.unique(np.atleast_1d(observed))
-        assert(0 < observed.size <= self.output_dim)
+        assert (0 < observed.size <= self.output_dim)
         unobserved = np.setdiff1d(np.arange(self.output_dim), observed)
-        assert(Ynew.shape[1] == observed.size)
+        assert (Ynew.shape[1] == observed.size)
 
         # obtain q(X*), only consider observed dimensions
         Xstarmu, Xstarvar = self.infer_latent_inputs(Ynew, observed=observed)
@@ -443,9 +457,9 @@ class BayesianGPLVM(GPModel):
         covar: np.ndarray, size Nnew (number of new points ) x D-k x D-k
         """
         observed = np.unique(np.atleast_1d(observed))
-        assert(0 < observed.size <= self.output_dim)
+        assert (0 < observed.size <= self.output_dim)
         unobserved = np.setdiff1d(np.arange(self.output_dim), observed)
-        assert(Ynew.shape[1] == observed.size)
+        assert (Ynew.shape[1] == observed.size)
 
         # obtain q(X*), only consider observed dimensions
         Xstarmu, Xstarvar = self.infer_latent_inputs(Ynew, observed=observed)
